@@ -1,15 +1,14 @@
 {
   "name": "signaldesk-relay",
   "version": "1.0.0",
-  "description": "SignalDesk live data relay — Databento + Finnhub + Investing.com calendar",
+  "description": "SignalDesk live data relay — Databento + Finnhub",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
   "dependencies": {
-    "ws": "^8.18.0",
-    "jsdom": "^24.1.0"
+    "ws": "^8.18.0"
   },
   "engines": {
     "node": ">=18.0.0"
