@@ -21,6 +21,10 @@ const FINNHUB_KEY   = process.env.FINNHUB_KEY   || 'd7mg8ahr01qngrvo3vm0d7mg8ahr
 // ── PORT ─────────────────────────────────────────
 const PORT = process.env.PORT || 8000;
 
+// ── TRADINGVIEW PRICE CACHE ───────────────────────
+// Stores the latest prices received from TradingView webhooks
+const tvPrices = {};
+
 // ── DATABENTO CONFIG ──────────────────────────────
 const DB_URL = 'wss://live.databento.com/v0/live';
 
@@ -70,26 +74,54 @@ let fhPingTimer = null;
 
 // Feed status
 const feedStatus = {
-  databento: 'offline',
-  finnhub:   'offline',
+  databento:   'offline',
+  finnhub:     'offline',
+  tradingview: 'offline',
 };
 
 // ── HTTP SERVER ───────────────────────────────────
 const httpServer = http.createServer((req, res) => {
+
+  // ── CORS headers (allow TradingView to POST) ──
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  // ── TRADINGVIEW WEBHOOK ──────────────────────────
+  if (req.method === 'POST' && req.url === '/webhook') {
+    let body = '';
+    req.on('data', chunk => body += chunk.toString());
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        handleTVWebhook(data);
+      } catch(e) {
+        // Plain text format — parse manually
+        handleTVWebhookText(body.trim());
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, ts: Date.now() }));
+    });
+    return;
+  }
+
+  // ── HEALTH CHECK ────────────────────────────────
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status:      'ok',
-      clients:     clients.size,
-      feeds:       feedStatus,
-      streaming:   Object.keys(lastPrices).length + ' symbols',
-      prices:      lastPrices,
-      uptime:      Math.round(process.uptime()) + 's',
+      status:    'ok',
+      clients:   clients.size,
+      feeds:     feedStatus,
+      tvPrices,
+      streaming: Object.keys(lastPrices).length + ' symbols',
+      uptime:    Math.round(process.uptime()) + 's',
     }));
-  } else {
-    res.writeHead(200);
-    res.end('SignalDesk — Databento + Finnhub Relay');
+    return;
   }
+
+  res.writeHead(200);
+  res.end('SignalDesk — Databento + Finnhub + TradingView Relay');
 });
 
 // ── DASHBOARD WS SERVER ───────────────────────────
@@ -534,6 +566,108 @@ function startCalendarFetcher() {
     const h = new Date().getHours();
     if (h >= 8 && h <= 17) fetchCalendar();
   }, 60 * 60 * 1000);
+}
+
+// ══════════════════════════════════════════════════
+// TRADINGVIEW WEBHOOK HANDLERS
+// Receives price alerts from TradingView Pine Script
+// POST to https://sinaldesk.up.railway.app/webhook
+// ══════════════════════════════════════════════════
+
+// Map TradingView ticker → our internal key
+const TV_SYM_MAP = {
+  // Futures
+  'NQ1!': 'NQ', 'NQ': 'NQ', 'CME_MINI:NQ1!': 'NQ',
+  'ES1!': 'ES', 'ES': 'ES', 'CME_MINI:ES1!': 'ES',
+  'YM1!': 'YM', 'YM': 'YM', 'CBOT_MINI:YM1!': 'YM',
+  'RTY1!':'RTY','RTY':'RTY','CME_MINI:RTY1!':'RTY',
+  'CL1!': 'CL', 'CL': 'CL', 'NYMEX:CL1!': 'CL',
+  'GC1!': 'GC', 'GC': 'GC', 'COMEX:GC1!': 'GC',
+  'SI1!': 'SI', 'SI': 'SI', 'COMEX:SI1!': 'SI',
+  // ETFs (if using TradingView stock alerts)
+  'QQQ': 'NQ', 'SPY': 'ES', 'DIA': 'YM', 'IWM': 'RTY',
+  // Forex
+  'EURUSD': 'EUR/USD', 'FX:EURUSD': 'EUR/USD',
+  'GBPUSD': 'GBP/USD', 'FX:GBPUSD': 'GBP/USD',
+  'USDJPY': 'USD/JPY', 'FX:USDJPY': 'USD/JPY',
+  // Crypto
+  'BTCUSD': 'BTC', 'BINANCE:BTCUSDT': 'BTC',
+  'ETHUSD': 'ETH', 'BINANCE:ETHUSDT': 'ETH',
+};
+
+function handleTVWebhook(data) {
+  // Expected JSON format from Pine Script:
+  // { "symbol": "NQ1!", "price": 19284.50, "close": 19284.50,
+  //   "high": 19300.00, "low": 19270.00, "volume": 12345,
+  //   "time": "2026-04-28T14:30:00Z", "alert": "NQ Price Update" }
+
+  const rawSym = data.symbol || data.ticker || '';
+  const key    = TV_SYM_MAP[rawSym] || TV_SYM_MAP[rawSym.toUpperCase()] || rawSym;
+  const price  = Number(data.price || data.close || data.last || 0);
+  if (!key || !price) {
+    console.warn('[TV Webhook] Could not parse:', JSON.stringify(data));
+    return;
+  }
+
+  console.log(`[TV Webhook] ${rawSym} → ${key} = ${price}`);
+
+  // Store in TV prices cache
+  tvPrices[key] = { price, high: data.high, low: data.low, volume: data.volume, ts: Date.now() };
+
+  // Update lastPrices — TV data takes priority as it's real CME data
+  if (!lastPrices[key]) lastPrices[key] = {};
+  const prev = lastPrices[key].futures || lastPrices[key].price;
+  lastPrices[key].futures   = price;
+  lastPrices[key].price     = price;
+  lastPrices[key].high      = data.high  || lastPrices[key].high;
+  lastPrices[key].low       = data.low   || lastPrices[key].low;
+  lastPrices[key].timestamp = Date.now();
+  lastPrices[key].source    = 'tradingview';
+  if (prev && prev > 0) lastPrices[key].chg = ((price - prev) / prev) * 100;
+
+  // Broadcast real price to all dashboard clients
+  broadcastAll({
+    type:    'quote',
+    symbol:  key,
+    futures: price,
+    high:    data.high  || null,
+    low:     data.low   || null,
+    volume:  data.volume|| null,
+    source:  'tradingview',
+  });
+
+  // Also broadcast a status message for the squawk
+  broadcastAll({
+    type:    'status',
+    message: `📺 TradingView: ${key} = ${price.toLocaleString()}`,
+  });
+
+  feedStatus.tradingview = 'live';
+}
+
+// Handle plain text format: "NQ1! 19284.50 H:19300 L:19270"
+function handleTVWebhookText(text) {
+  try {
+    // Try to extract symbol and price from text
+    const parts = text.split(/[\s,]+/);
+    if (parts.length >= 2) {
+      const sym   = parts[0];
+      const price = parseFloat(parts[1]);
+      if (sym && !isNaN(price)) {
+        handleTVWebhook({ symbol: sym, price });
+        return;
+      }
+    }
+    // Try key=value format: "symbol=NQ1!,price=19284.50"
+    const obj = {};
+    text.split(',').forEach(pair => {
+      const [k,v] = pair.split('=');
+      if (k && v) obj[k.trim()] = v.trim();
+    });
+    if (obj.symbol && obj.price) handleTVWebhook(obj);
+  } catch(e) {
+    console.warn('[TV Webhook] Could not parse text:', text);
+  }
 }
 
 // ── HEARTBEAT ─────────────────────────────────────
