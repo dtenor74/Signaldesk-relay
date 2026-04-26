@@ -427,6 +427,174 @@ function broadcastFeeds() {
   });
 }
 
+// ══════════════════════════════════════════════════
+// INVESTING.COM ECONOMIC CALENDAR
+// Fetched server-side (bypasses CORS/bot protection)
+// ══════════════════════════════════════════════════
+const { JSDOM } = require('jsdom');
+
+async function fetchInvestingCalendar() {
+  console.log('[Calendar] Fetching Investing.com economic calendar...');
+  return new Promise((resolve) => {
+    const options = {
+      hostname: 'www.investing.com',
+      path:     '/economic-calendar/',
+      method:   'GET',
+      headers: {
+        'User-Agent':      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection':      'keep-alive',
+        'Cache-Control':   'no-cache',
+        'Referer':         'https://www.investing.com/',
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => {
+        try {
+          const html = Buffer.concat(chunks).toString('utf8');
+          const events = parseCalendarHTML(html);
+          console.log(`[Calendar] Parsed ${events.length} events`);
+          if (events.length > 0) {
+            broadcastAll({ type: 'calendar', events });
+            console.log('[Calendar] Sent to dashboard ✓');
+          } else {
+            console.warn('[Calendar] No events parsed — HTML structure may have changed');
+          }
+          resolve(events);
+        } catch(e) {
+          console.error('[Calendar] Parse error:', e.message);
+          resolve([]);
+        }
+      });
+    });
+
+    req.on('error', (e) => {
+      console.error('[Calendar] Fetch error:', e.message);
+      resolve([]);
+    });
+
+    req.setTimeout(15000, () => {
+      req.destroy();
+      console.error('[Calendar] Timeout');
+      resolve([]);
+    });
+
+    req.end();
+  });
+}
+
+function parseCalendarHTML(html) {
+  const events = [];
+  try {
+    const dom = new JSDOM(html);
+    const doc = dom.window.document;
+    const rows = doc.querySelectorAll('tr.js-event-item');
+
+    // Track current date from section headers
+    let currentDate = '';
+
+    // Also look for date headers
+    const allRows = doc.querySelectorAll('#economicCalendarData tr');
+    allRows.forEach(row => {
+      // Date header row
+      if (row.classList.contains('theDay') || row.querySelector('td.theDay')) {
+        const dateText = row.textContent?.trim();
+        if (dateText) {
+          try {
+            const d = new Date(dateText + ' 2026');
+            if (!isNaN(d)) currentDate = d.toISOString().slice(0, 10);
+          } catch(e) {}
+        }
+        return;
+      }
+
+      if (!row.classList.contains('js-event-item')) return;
+
+      try {
+        const timeEl     = row.querySelector('.js-time,.time');
+        const currEl     = row.querySelector('.flagCur,.left.flagCur');
+        const impEl      = row.querySelector('.sentiment,.icon');
+        const eventEl    = row.querySelector('.event a, .event');
+        const actualEl   = row.querySelector('.actual');
+        const forecastEl = row.querySelector('.forecast');
+        const prevEl     = row.querySelector('.prev');
+
+        const eventName = eventEl?.textContent?.trim();
+        if (!eventName || eventName.length < 3) return;
+
+        // Date from attribute or current section
+        const dateAttr = row.getAttribute('data-event-datetime') || '';
+        let dateKey = currentDate;
+        if (dateAttr) {
+          const d = new Date(dateAttr);
+          if (!isNaN(d)) dateKey = d.toISOString().slice(0, 10);
+        }
+        if (!dateKey) return;
+
+        // Impact from bull icons
+        const highIcons = impEl ? (impEl.querySelectorAll('i.grayFullBullishIcon').length + impEl.querySelectorAll('i.greenBullishIcon').length) : 0;
+        const impact = highIcons >= 3 ? 'high' : highIcons >= 2 ? 'medium' : 'low';
+
+        const currency = currEl?.textContent?.trim()?.slice(0, 3) || 'USD';
+        const time     = timeEl?.textContent?.trim() || '--:--';
+        const actual   = cleanVal(actualEl?.textContent);
+        const forecast = cleanVal(forecastEl?.textContent);
+        const previous = cleanVal(prevEl?.textContent);
+
+        // Beat/miss
+        let beat = null;
+        if (actual && forecast) {
+          const a = parseFloat(actual.replace(/[^0-9.-]/g, ''));
+          const f = parseFloat(forecast.replace(/[^0-9.-]/g, ''));
+          if (!isNaN(a) && !isNaN(f)) beat = a >= f;
+        }
+
+        // Type detection
+        const lower = eventName.toLowerCase();
+        let type = 'data';
+        if (lower.includes('speaks') || lower.includes('speech') || lower.includes('press conf')) type = 'speaker';
+        else if (lower.includes('auction') || lower.includes('bill yield') || lower.includes('note yield') || lower.includes('bond yield') || lower.includes('bid-to-cover')) type = 'auction';
+        else if (lower.match(/\b(q[1-4]|earnings)\b/)) type = 'earnings';
+        else if (lower.includes('rate decision') || lower.includes('rate statement') || lower.includes('monetary policy')) type = 'meeting';
+
+        // Speaker name
+        let speaker = null;
+        if (type === 'speaker') {
+          const m = eventName.match(/^([A-Z][a-z]+(?:'s)?(?:\s+[A-Z][a-z]+)*)/);
+          speaker = m ? m[1].replace(/'s$/, '') : eventName.replace(/\s+Speaks?.*$/i, '').trim();
+        }
+
+        events.push({
+          date: dateKey, time, type,
+          event: eventName, speaker, role: null, topic: null, venue: null,
+          impact, currency, actual, forecast, previous, beat,
+        });
+      } catch(e) {}
+    });
+  } catch(e) {
+    console.error('[Calendar Parser]', e.message);
+  }
+  return events;
+}
+
+function cleanVal(txt) {
+  if (!txt) return null;
+  const v = txt.trim().replace(/\s+/g, ' ');
+  return (v === '' || v === '\u00a0' || v === '&nbsp;') ? null : v;
+}
+
+// Fetch calendar on boot and every 4 hours
+function startCalendarFetcher() {
+  fetchInvestingCalendar();
+  setInterval(fetchInvestingCalendar, 4 * 60 * 60 * 1000);
+  // Also send on new client connect — done in wss.on('connection') via broadcastAll
+}
+
 // ── HEARTBEAT ─────────────────────────────────────
 setInterval(() => {
   broadcastAll({
@@ -449,10 +617,8 @@ httpServer.listen(PORT, () => {
   console.log(`║  Finnhub:   ${FINNHUB_KEY.slice(0,12)}...              ║`);
   console.log(`╚════════════════════════════════════════════════╝\n`);
 
-  // Connect both feeds simultaneously
   connectDatabento();
   connectFinnhub();
-
-  // Initial REST poll to populate prices right away
   setTimeout(pollStaleSymbols, 4000);
+  setTimeout(startCalendarFetcher, 3000);
 });
