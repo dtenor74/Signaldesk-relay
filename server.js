@@ -1,286 +1,416 @@
 /**
- * SignalDesk — Finnhub Live Data Relay
- * ─────────────────────────────────────────
- * Streams real-time prices for ETF proxies (NQ/ES/YM/RTY),
- * forex pairs, and crypto from Finnhub into SignalDesk.
+ * SignalDesk — Combined Databento + Finnhub Relay
+ * ─────────────────────────────────────────────────
+ * Databento  → Real NQ, ES, YM, RTY, CL, GC futures (true CME tick data)
+ * Finnhub    → Forex, Crypto, Stocks, ETF proxies (free tier)
  *
- * FREE tier covers everything needed:
- *   - US stocks/ETFs (QQQ→NQ, SPY→ES, DIA→YM, IWM→RTY)
- *   - Forex pairs (EUR/USD, GBP/USD, USD/JPY, etc.)
- *   - Crypto (BTC, ETH, SOL)
+ * Both feeds run simultaneously and broadcast to SignalDesk dashboard.
  *
- * DEPLOY on Railway.app (free):
- *   Push server.js + package.json to GitHub
- *   Connect Railway → auto-deploys
- *   SignalDesk Settings → wss://your-app.up.railway.app/ws
- *
- * LOCAL:
- *   npm install && node server.js
- *   SignalDesk Settings → ws://localhost:8000/ws
+ * DEPLOY: Push to GitHub → Railway auto-deploys
+ * DASHBOARD URL: wss://sinaldesk.up.railway.app/ws
  */
 
 const WebSocket = require('ws');
 const http      = require('http');
 const https     = require('https');
 
-// ── API KEY ──────────────────────────────────────
-const FINNHUB_KEY = process.env.FINNHUB_KEY || 'd7mg8ahr01qngrvo3vm0d7mg8ahr01qngrvo3vmg';
+// ── API KEYS ─────────────────────────────────────
+const DATABENTO_KEY = process.env.DATABENTO_KEY || 'AELXndmcsCuAJ5bARvJtPgpD8bG9c';
+const FINNHUB_KEY   = process.env.FINNHUB_KEY   || 'd7mg8ahr01qngrvo3vm0d7mg8ahr01qngrvo3vmg';
 
-// ── SYMBOLS ──────────────────────────────────────
-// ETF proxies for Titan futures instruments
-const ETF_SYMBOLS = ['QQQ','SPY','DIA','IWM','GLD','USO','SLV','TLT','XLF','XLE'];
-// Individual stocks for watchlist
-const STOCK_SYMBOLS = ['NVDA','AAPL','TSLA','META','MSFT','AMZN','GOOGL'];
-// Forex — Finnhub format
-const FOREX_SYMBOLS = ['OANDA:EUR_USD','OANDA:GBP_USD','OANDA:USD_JPY','OANDA:USD_CAD','OANDA:AUD_USD','OANDA:USD_CHF'];
-// Crypto — Finnhub format
-const CRYPTO_SYMBOLS = ['BINANCE:BTCUSDT','BINANCE:ETHUSDT','BINANCE:SOLUSDT'];
+// ── PORT ─────────────────────────────────────────
+const PORT = process.env.PORT || 8000;
 
-// Map ETF → Titan instrument key
-const ETF_TO_TITAN = {
-  'QQQ':'NQ', 'SPY':'ES', 'DIA':'YM', 'IWM':'RTY',
-  'GLD':'GC', 'USO':'CL', 'SLV':'SI',
+// ── DATABENTO CONFIG ──────────────────────────────
+const DB_URL = 'wss://live.databento.com/v0/live';
+
+// CME futures continuous front-month contracts
+const DB_FUTURES = [
+  { dbSym: 'NQ.c.0',  key: 'NQ'  },
+  { dbSym: 'ES.c.0',  key: 'ES'  },
+  { dbSym: 'YM.c.0',  key: 'YM'  },
+  { dbSym: 'RTY.c.0', key: 'RTY' },
+  { dbSym: 'CL.c.0',  key: 'CL'  },
+  { dbSym: 'GC.c.0',  key: 'GC'  },
+  { dbSym: 'SI.c.0',  key: 'SI'  },
+];
+
+// ── FINNHUB CONFIG ────────────────────────────────
+const FH_URL = `wss://ws.finnhub.io?token=${FINNHUB_KEY}`;
+
+// ETF proxies for cross-reference + spot price tracking
+const FH_ETFS    = ['QQQ','SPY','DIA','IWM','GLD','USO','SLV','TLT','XLF','XLE'];
+const FH_STOCKS  = ['NVDA','AAPL','TSLA','META','MSFT','AMZN','GOOGL','AMD'];
+const FH_FOREX   = ['OANDA:EUR_USD','OANDA:GBP_USD','OANDA:USD_JPY','OANDA:USD_CAD','OANDA:AUD_USD','OANDA:USD_CHF'];
+const FH_CRYPTO  = ['BINANCE:BTCUSDT','BINANCE:ETHUSDT','BINANCE:SOLUSDT','BINANCE:XRPUSDT'];
+
+// ETF → Titan key (for spot price cross-reference with futures)
+const ETF_TITAN = {
+  'QQQ':'NQ','SPY':'ES','DIA':'YM','IWM':'RTY',
+  'GLD':'GC','USO':'CL','SLV':'SI',
 };
 
-// Map Finnhub symbol → clean display symbol
-const SYMBOL_DISPLAY = {
+// Finnhub display symbol cleanup
+const FH_DISPLAY = {
   'OANDA:EUR_USD':'EUR/USD','OANDA:GBP_USD':'GBP/USD',
   'OANDA:USD_JPY':'USD/JPY','OANDA:USD_CAD':'USD/CAD',
   'OANDA:AUD_USD':'AUD/USD','OANDA:USD_CHF':'USD/CHF',
-  'BINANCE:BTCUSDT':'BTC','BINANCE:ETHUSDT':'ETH','BINANCE:SOLUSDT':'SOL',
+  'BINANCE:BTCUSDT':'BTC','BINANCE:ETHUSDT':'ETH',
+  'BINANCE:SOLUSDT':'SOL','BINANCE:XRPUSDT':'XRP',
 };
 
-// ── STATE ────────────────────────────────────────
-const PORT     = process.env.PORT || 8000;
-let clients    = new Set();
-let lastPrices = {};
-let finnhubWs  = null;
-let reconnTimer= null;
-let pingTimer  = null;
+// ── STATE ─────────────────────────────────────────
+let clients     = new Set();
+let lastPrices  = {};   // symbol → latest price data
+let dbWs        = null;
+let fhWs        = null;
+let dbReconTimer= null;
+let fhReconTimer= null;
+let fhPingTimer = null;
 
-// ── HTTP SERVER ──────────────────────────────────
+// Feed status
+const feedStatus = {
+  databento: 'offline',
+  finnhub:   'offline',
+};
+
+// ── HTTP SERVER ───────────────────────────────────
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status:    'ok',
-      clients:   clients.size,
-      finnhub:   finnhubWs?.readyState === 1 ? 'live' : 'offline',
-      streaming: Object.keys(lastPrices).length + ' symbols',
-      uptime:    Math.round(process.uptime()) + 's',
-      prices:    lastPrices,
+      status:      'ok',
+      clients:     clients.size,
+      feeds:       feedStatus,
+      streaming:   Object.keys(lastPrices).length + ' symbols',
+      prices:      lastPrices,
+      uptime:      Math.round(process.uptime()) + 's',
     }));
   } else {
     res.writeHead(200);
-    res.end('SignalDesk Finnhub Relay — running');
+    res.end('SignalDesk — Databento + Finnhub Relay');
   }
 });
 
-// ── DASHBOARD WS SERVER ──────────────────────────
+// ── DASHBOARD WS SERVER ───────────────────────────
 const wss = new WebSocket.Server({ server: httpServer, path: '/ws' });
 
 wss.on('connection', ws => {
   console.log(`[Client] Connected · Total: ${clients.size + 1}`);
   clients.add(ws);
 
-  // Send current snapshot immediately on connect
-  send(ws, { type: 'status', message: '✅ Connected to SignalDesk Finnhub relay' });
+  // Immediate snapshot of all current prices
+  send(ws, { type: 'status', message: '✅ Connected to SignalDesk relay' });
   Object.entries(lastPrices).forEach(([sym, data]) => {
     send(ws, { type: 'quote', symbol: sym, ...data });
   });
   send(ws, {
-    type: 'status',
-    message: finnhubWs?.readyState === 1
-      ? '🟢 Finnhub streaming live data'
-      : '🔄 Connecting to Finnhub...'
+    type: 'feeds',
+    databento: feedStatus.databento,
+    finnhub:   feedStatus.finnhub,
+    message: `Databento: ${feedStatus.databento} | Finnhub: ${feedStatus.finnhub}`,
   });
 
-  ws.on('close', () => { clients.delete(ws); console.log(`[Client] Left · Remaining: ${clients.size}`); });
+  ws.on('close', () => { clients.delete(ws); });
   ws.on('error', ()  => clients.delete(ws));
-});
-
-// ── CONNECT FINNHUB ──────────────────────────────
-function connectFinnhub() {
-  console.log('[Finnhub] Connecting...');
-  finnhubWs = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_KEY}`);
-
-  finnhubWs.on('open', () => {
-    console.log('[Finnhub] Connected ✓ — subscribing to symbols');
-    broadcastAll({ type: 'status', message: '🔑 Finnhub connected — subscribing to feeds' });
-
-    // Subscribe to all symbols
-    const allSymbols = [
-      ...ETF_SYMBOLS,
-      ...STOCK_SYMBOLS,
-      ...FOREX_SYMBOLS,
-      ...CRYPTO_SYMBOLS,
-    ];
-
-    allSymbols.forEach((sym, i) => {
-      // Stagger subscriptions slightly to avoid rate limiting
-      setTimeout(() => {
-        if (finnhubWs?.readyState === 1) {
-          finnhubWs.send(JSON.stringify({ type: 'subscribe', symbol: sym }));
-        }
-      }, i * 50);
-    });
-
-    // Ping every 20s to keep connection alive
-    if (pingTimer) clearInterval(pingTimer);
-    pingTimer = setInterval(() => {
-      if (finnhubWs?.readyState === 1) {
-        finnhubWs.send(JSON.stringify({ type: 'ping' }));
-      }
-    }, 20000);
-
-    broadcastAll({ type: 'status', message: `📡 Subscribed to ${allSymbols.length} symbols` });
-  });
-
-  finnhubWs.on('message', raw => {
+  ws.on('message', raw => {
     try {
       const msg = JSON.parse(raw);
-      if (msg.type === 'trade') handleTrades(msg.data);
-      if (msg.type === 'ping')  finnhubWs.send(JSON.stringify({ type: 'pong' }));
-      if (msg.type === 'error') {
-        console.error('[Finnhub] Error:', msg.msg);
-        broadcastAll({ type: 'status', message: `⚠️ Finnhub: ${msg.msg}` });
+      if (msg.cmd === 'reset_baseline') {
+        broadcastAll({ type: 'baseline_reset', ts: Date.now() });
       }
+    } catch(e) {}
+  });
+});
+
+// ══════════════════════════════════════════════════
+// DATABENTO — CME Futures Feed
+// ══════════════════════════════════════════════════
+function connectDatabento() {
+  if (dbReconTimer) { clearTimeout(dbReconTimer); dbReconTimer = null; }
+  console.log('[Databento] Connecting...');
+
+  try {
+    dbWs = new WebSocket(DB_URL, {
+      headers: { 'Authorization': `Bearer ${DATABENTO_KEY}` }
+    });
+  } catch(e) {
+    console.error('[Databento] Failed to connect:', e.message);
+    schedulDbRecon();
+    return;
+  }
+
+  dbWs.on('open', () => {
+    console.log('[Databento] Connected ✓ — authenticating');
+    feedStatus.databento = 'connecting';
+
+    // Authenticate
+    dbWs.send(JSON.stringify({ action: 'auth', key: DATABENTO_KEY }));
+
+    // Subscribe to CME futures trades
+    dbWs.send(JSON.stringify({
+      action:   'subscribe',
+      schema:   'trades',
+      dataset:  'GLBX.MDP3',
+      symbols:  DB_FUTURES.map(f => f.dbSym),
+      stype_in: 'continuous',
+    }));
+
+    console.log('[Databento] Subscribed to:', DB_FUTURES.map(f => f.dbSym).join(', '));
+    broadcastAll({ type: 'status', message: '🟢 Databento CME futures feed active' });
+    feedStatus.databento = 'live';
+    broadcastFeeds();
+  });
+
+  dbWs.on('message', raw => {
+    try {
+      // Databento sends JSON messages
+      const msg = JSON.parse(raw.toString());
+      handleDatabentoMsg(msg);
     } catch(e) {
-      console.error('[Finnhub] Parse error:', e.message);
+      // Some Databento messages are binary — skip gracefully
     }
   });
 
-  finnhubWs.on('close', code => {
-    console.log(`[Finnhub] Closed (${code}) — reconnecting in 5s`);
-    if (pingTimer) clearInterval(pingTimer);
-    broadcastAll({ type: 'status', message: '🔴 Finnhub disconnected — reconnecting...' });
-    scheduleReconnect();
+  dbWs.on('close', code => {
+    console.log(`[Databento] Closed (${code}) — reconnecting in 8s`);
+    feedStatus.databento = 'offline';
+    broadcastAll({ type: 'status', message: '🔴 Databento disconnected — reconnecting...' });
+    broadcastFeeds();
+    schedulDbRecon();
   });
 
-  finnhubWs.on('error', err => {
-    console.error('[Finnhub] Error:', err.message);
-    broadcastAll({ type: 'status', message: `⚠️ ${err.message}` });
+  dbWs.on('error', err => {
+    console.error('[Databento] Error:', err.message);
+    feedStatus.databento = 'error';
+    broadcastAll({ type: 'status', message: `⚠️ Databento: ${err.message}` });
+    broadcastFeeds();
   });
 }
 
-// ── HANDLE TRADE DATA ────────────────────────────
-function handleTrades(trades) {
-  if (!trades || !trades.length) return;
+function handleDatabentoMsg(msg) {
+  if (!msg) return;
 
-  // Finnhub batches trades — take the latest price per symbol
+  // Auth response
+  if (msg.type === 'auth' || msg.action === 'auth') {
+    if (msg.success || msg.status === 'ok') {
+      console.log('[Databento] Authenticated ✓');
+      feedStatus.databento = 'live';
+      broadcastAll({ type: 'status', message: '🔑 Databento authorized — streaming CME futures' });
+    }
+    return;
+  }
+
+  // Trade record — Databento sends these as objects with hd (header) + price
+  const symbol = msg.symbol || msg.instrument_id;
+  const price  = msg.price  != null ? Number(msg.price) / 1e9 : // Fixed-point nano
+                 msg.px     != null ? Number(msg.px)    / 1e9 : null;
+  const size   = msg.size   || msg.qty || null;
+
+  if (!symbol || !price) return;
+
+  // Map to our key
+  const entry = DB_FUTURES.find(f => f.dbSym === symbol || symbol.includes(f.key));
+  if (!entry) return;
+
+  const key = entry.key;
+
+  // Update stored price
+  if (!lastPrices[key]) lastPrices[key] = {};
+  const prev = lastPrices[key].futures;
+  lastPrices[key].futures   = price;
+  lastPrices[key].size      = size;
+  lastPrices[key].timestamp = Date.now();
+  lastPrices[key].source    = 'databento';
+
+  // Calculate real % change
+  if (prev && prev > 0) {
+    lastPrices[key].chg = ((price - prev) / prev) * 100;
+  }
+
+  // Broadcast to all dashboard clients
+  broadcastAll({
+    type:    'quote',
+    symbol:  key,
+    futures: price,
+    spot:    lastPrices[key].spot || null,
+    size,
+    source:  'databento',
+  });
+}
+
+function schedulDbRecon() {
+  if (dbReconTimer) return;
+  dbReconTimer = setTimeout(connectDatabento, 8000);
+}
+
+// ══════════════════════════════════════════════════
+// FINNHUB — Forex, Crypto, Stocks, ETFs
+// ══════════════════════════════════════════════════
+function connectFinnhub() {
+  if (fhReconTimer) { clearTimeout(fhReconTimer); fhReconTimer = null; }
+  console.log('[Finnhub] Connecting...');
+
+  fhWs = new WebSocket(FH_URL);
+
+  fhWs.on('open', () => {
+    console.log('[Finnhub] Connected ✓ — subscribing');
+    feedStatus.finnhub = 'connecting';
+
+    const allSymbols = [
+      ...FH_ETFS,
+      ...FH_STOCKS,
+      ...FH_FOREX,
+      ...FH_CRYPTO,
+    ];
+
+    // Stagger subscriptions to avoid rate limiting
+    allSymbols.forEach((sym, i) => {
+      setTimeout(() => {
+        if (fhWs?.readyState === WebSocket.OPEN) {
+          fhWs.send(JSON.stringify({ type: 'subscribe', symbol: sym }));
+        }
+      }, i * 60);
+    });
+
+    // Ping every 20s
+    if (fhPingTimer) clearInterval(fhPingTimer);
+    fhPingTimer = setInterval(() => {
+      if (fhWs?.readyState === WebSocket.OPEN) {
+        fhWs.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 20000);
+
+    broadcastAll({ type: 'status', message: `📡 Finnhub subscribed — ${allSymbols.length} symbols` });
+    feedStatus.finnhub = 'live';
+    broadcastFeeds();
+  });
+
+  fhWs.on('message', raw => {
+    try {
+      const msg = JSON.parse(raw);
+      if (msg.type === 'trade') handleFinnhubTrades(msg.data);
+      if (msg.type === 'ping')  fhWs.send(JSON.stringify({ type: 'pong' }));
+      if (msg.type === 'error') {
+        console.error('[Finnhub] Error:', msg.msg);
+        if (msg.msg?.includes('rate limit')) {
+          console.log('[Finnhub] Rate limited — backing off');
+        }
+      }
+    } catch(e) {}
+  });
+
+  fhWs.on('close', code => {
+    console.log(`[Finnhub] Closed (${code}) — reconnecting in 5s`);
+    if (fhPingTimer) clearInterval(fhPingTimer);
+    feedStatus.finnhub = 'offline';
+    broadcastAll({ type: 'status', message: '🔴 Finnhub disconnected — reconnecting...' });
+    broadcastFeeds();
+    scheduleFhRecon();
+  });
+
+  fhWs.on('error', err => {
+    console.error('[Finnhub] Error:', err.message);
+    feedStatus.finnhub = 'error';
+    broadcastFeeds();
+  });
+}
+
+function handleFinnhubTrades(trades) {
+  if (!trades?.length) return;
+
+  // Take latest price per symbol from the batch
   const latest = {};
   trades.forEach(t => {
     if (!latest[t.s] || t.t > latest[t.s].t) latest[t.s] = t;
   });
 
   Object.entries(latest).forEach(([fhSym, trade]) => {
-    const price = trade.p;
-    const size  = trade.v;
+    const price      = trade.p;
+    const size       = trade.v;
+    const displaySym = FH_DISPLAY[fhSym] || fhSym;
+
     if (!price) return;
 
-    // Get clean display symbol
-    const displaySym = SYMBOL_DISPLAY[fhSym] || fhSym;
-
-    // Store price
+    // Store raw price
     if (!lastPrices[displaySym]) lastPrices[displaySym] = {};
-    lastPrices[displaySym] = { price, size, timestamp: trade.t };
+    const prev = lastPrices[displaySym].price;
+    lastPrices[displaySym] = { price, size, timestamp: trade.t, source: 'finnhub' };
+    if (prev && prev > 0) lastPrices[displaySym].chg = ((price - prev) / prev) * 100;
 
     // Broadcast raw quote
-    broadcastAll({ type: 'quote', symbol: displaySym, price, size });
+    broadcastAll({ type: 'quote', symbol: displaySym, price, size, source: 'finnhub' });
 
-    // If it's an ETF proxy → also broadcast as Titan instrument
-    const titanKey = ETF_TO_TITAN[fhSym];
+    // If ETF proxy → also update spot price for Titan spread calc
+    const titanKey = ETF_TITAN[fhSym];
     if (titanKey) {
       if (!lastPrices[titanKey]) lastPrices[titanKey] = {};
-      // Use previous futures price if we have it, otherwise use ETF as proxy
-      const prevFutures = lastPrices[titanKey].futures;
-      // Scale ETF price to approximate futures price
-      const scale = FUTURES_SCALE[titanKey] || 1;
-      const futuresProxy = price * scale;
+      lastPrices[titanKey].spot      = price;
+      lastPrices[titanKey].timestamp = trade.t;
 
-      lastPrices[titanKey] = {
-        futures:   prevFutures || futuresProxy,
-        spot:      price,  // ETF = spot proxy
-        timestamp: trade.t,
-      };
-
+      // Broadcast spot update for this Titan instrument
       broadcastAll({
         type:    'quote',
         symbol:  titanKey,
-        futures: lastPrices[titanKey].futures,
+        futures: lastPrices[titanKey].futures || null,
         spot:    price,
         etfProxy: fhSym,
+        source:  'finnhub_proxy',
       });
     }
   });
 }
 
-// Approximate multipliers to convert ETF price → futures price
-// These are rough — the Titan BPS system tracks relative moves, so exact price matters less
-const FUTURES_SCALE = {
-  NQ:  40,   // QQQ ~485 × 40 ≈ NQ ~19400
-  ES:  11.2, // SPY ~540 × 11.2 ≈ ES ~6000 (adjust as needed)
-  YM:  83,   // DIA ~403 × 83 ≈ YM ~33449
-  RTY: 4.1,  // IWM ~200 × 4.1 ≈ RTY ~820 (check current)
-  GC:  1,    // GLD tracks gold closely enough
-  CL:  1,    // USO tracks oil
-  SI:  1,    // SLV tracks silver
-};
+function scheduleFhRecon() {
+  if (fhReconTimer) return;
+  fhReconTimer = setTimeout(connectFinnhub, 5000);
+}
 
-// ── REST API FALLBACK ────────────────────────────
-// Poll Finnhub REST API for any symbols that haven't ticked via WS
-// This ensures we always have a price even in slow markets
-async function pollQuotes() {
-  const symbols = [...ETF_SYMBOLS, ...STOCK_SYMBOLS];
-  for (const sym of symbols) {
-    if (lastPrices[sym] && Date.now() - lastPrices[sym].timestamp < 60000) continue; // skip if fresh
+// ── REST FALLBACK (poll stale symbols every 45s) ──
+async function pollStaleSymbols() {
+  const staleCutoff = Date.now() - 60000; // 60s
+  const toRefresh = [...FH_ETFS, ...FH_STOCKS].filter(sym => {
+    const p = lastPrices[sym];
+    return !p || p.timestamp < staleCutoff;
+  });
+
+  for (const sym of toRefresh.slice(0, 10)) { // max 10 per cycle
     try {
-      const price = await fetchQuote(sym);
+      const price = await fetchFinnhubRest(sym);
       if (price) {
         lastPrices[sym] = { price, timestamp: Date.now(), source: 'rest' };
-        broadcastAll({ type: 'quote', symbol: sym, price });
+        broadcastAll({ type: 'quote', symbol: sym, price, source: 'finnhub_rest' });
         // Titan proxy
-        const titanKey = ETF_TO_TITAN[sym];
+        const titanKey = ETF_TITAN[sym];
         if (titanKey) {
-          const scale = FUTURES_SCALE[titanKey] || 1;
           if (!lastPrices[titanKey]) lastPrices[titanKey] = {};
           lastPrices[titanKey].spot = price;
-          if (!lastPrices[titanKey].futures) lastPrices[titanKey].futures = price * scale;
-          broadcastAll({ type: 'quote', symbol: titanKey, futures: lastPrices[titanKey].futures, spot: price });
+          broadcastAll({ type: 'quote', symbol: titanKey, futures: lastPrices[titanKey].futures || null, spot: price });
         }
       }
     } catch(e) {}
-    await sleep(200); // 200ms between requests to respect rate limits
+    await sleep(300);
   }
 }
 
-function fetchQuote(sym) {
+function fetchFinnhubRest(sym) {
   return new Promise((resolve, reject) => {
-    https.get(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`, res => {
+    const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${FINNHUB_KEY}`;
+    https.get(url, res => {
       let raw = '';
       res.on('data', d => raw += d);
       res.on('end', () => {
-        try {
-          const data = JSON.parse(raw);
-          resolve(data.c || null); // c = current price
-        } catch(e) { resolve(null); }
+        try { resolve(JSON.parse(raw).c || null); }
+        catch(e) { resolve(null); }
       });
     }).on('error', reject);
   });
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+setInterval(pollStaleSymbols, 45000);
 
-// Poll REST every 30s as fallback for stale symbols
-setInterval(pollQuotes, 30000);
-
-// ── RECONNECT ────────────────────────────────────
-function scheduleReconnect() {
-  if (reconnTimer) return;
-  reconnTimer = setTimeout(() => { reconnTimer = null; connectFinnhub(); }, 5000);
-}
-
-// ── BROADCAST ────────────────────────────────────
+// ── BROADCAST HELPERS ─────────────────────────────
 function broadcastAll(msg) {
   const d = JSON.stringify(msg);
   clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(d); });
@@ -288,27 +418,41 @@ function broadcastAll(msg) {
 function send(ws, msg) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
+function broadcastFeeds() {
+  broadcastAll({
+    type:      'feeds',
+    databento: feedStatus.databento,
+    finnhub:   feedStatus.finnhub,
+    message:   `Databento: ${feedStatus.databento} | Finnhub: ${feedStatus.finnhub}`,
+  });
+}
 
-// ── HEARTBEAT ────────────────────────────────────
+// ── HEARTBEAT ─────────────────────────────────────
 setInterval(() => {
   broadcastAll({
     type:      'heartbeat',
     ts:        Date.now(),
     clients:   clients.size,
-    finnhub:   finnhubWs?.readyState === 1 ? 'live' : 'offline',
+    feeds:     feedStatus,
     streaming: Object.keys(lastPrices).length,
   });
 }, 30000);
 
 // ── BOOT ─────────────────────────────────────────
 httpServer.listen(PORT, () => {
-  console.log(`\n╔══════════════════════════════════════════╗`);
-  console.log(`║  SignalDesk — Finnhub Live Relay          ║`);
-  console.log(`║  WS:     ws://localhost:${PORT}/ws          ║`);
-  console.log(`║  Health: http://localhost:${PORT}/health    ║`);
-  console.log(`╚══════════════════════════════════════════╝\n`);
-  console.log(`[Boot] Finnhub key: ${FINNHUB_KEY.slice(0,8)}...`);
+  console.log(`\n╔════════════════════════════════════════════════╗`);
+  console.log(`║  SignalDesk — Databento + Finnhub Relay        ║`);
+  console.log(`║  WS:       ws://localhost:${PORT}/ws              ║`);
+  console.log(`║  Health:   http://localhost:${PORT}/health        ║`);
+  console.log(`╠════════════════════════════════════════════════╣`);
+  console.log(`║  Databento: ${DATABENTO_KEY.slice(0,12)}...              ║`);
+  console.log(`║  Finnhub:   ${FINNHUB_KEY.slice(0,12)}...              ║`);
+  console.log(`╚════════════════════════════════════════════════╝\n`);
+
+  // Connect both feeds simultaneously
+  connectDatabento();
   connectFinnhub();
-  // Initial REST poll to get prices right away
-  setTimeout(pollQuotes, 3000);
+
+  // Initial REST poll to populate prices right away
+  setTimeout(pollStaleSymbols, 4000);
 });
